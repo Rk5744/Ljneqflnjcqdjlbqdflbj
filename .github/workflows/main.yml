@@ -1,4 +1,4 @@
-name: sessssy
+name: Remote iOS 26.5 Simulator
 
 on:
   workflow_dispatch:
@@ -11,6 +11,10 @@ on:
         description: 'Device model (if the iOS version does not support it, an iPhone it does support is used)'
         default: 'iPhone 17 Pro'
         required: true
+
+concurrency:
+  group: remote-ios-simulator
+  cancel-in-progress: true
 
 jobs:
   simulator:
@@ -25,10 +29,18 @@ jobs:
       QUALITY: '0.6'
       AUDIO: 'true'
       TZNAME: 'America/New_York'
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
 
     steps:
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Select newest installed Xcode
         run: |
+          echo "PYTHON_BIN=$(command -v python3)" >> "$GITHUB_ENV"
           XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
           if [ -n "$XC" ]; then sudo xcode-select -s "$XC/Contents/Developer"; fi
           xcodebuild -version
@@ -72,7 +84,7 @@ jobs:
           XC=$(xcode-select -p)
           APP="${XC%/Developer}"
           CLIENTS_BID="com.apple.Terminal com.apple.dt.Xcode com.apple.CoreSimulator.CoreSimulatorService com.apple.iphonesimulator com.apple.dt.SimulatorTrampoline com.apple.dt.xcodebuild com.apple.CoreSimulator.SimulatorTrampoline"
-          CLIENTS_PATH="/bin/bash /bin/zsh /bin/sh /usr/bin/python3 /usr/bin/osascript /usr/bin/xcrun /usr/bin/xcodebuild /usr/sbin/sshd /usr/libexec/sshd-keygen-wrapper $APP/Contents/Developer/Applications/Simulator.app $APP/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator $APP/Contents/Developer/Library/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/com.apple.CoreSimulator.CoreSimulatorService.xpc/Contents/MacOS/com.apple.CoreSimulator.CoreSimulatorService $(command -v dotnet || true) $(command -v python3 || true) $PYS"
+          CLIENTS_PATH="/bin/bash /bin/zsh /bin/sh /usr/bin/python3 /usr/bin/osascript /usr/bin/xcrun /usr/bin/xcodebuild /usr/sbin/sshd /usr/libexec/sshd-keygen-wrapper $APP/Contents/Developer/Applications/Simulator.app $APP/Contents/Developer/Applications/Simulator.app/Contents/MacOS/Simulator $APP/Contents/Developer/Library/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/com.apple.CoreSimulator.CoreSimulatorService.xpc/Contents/MacOS/com.apple.CoreSimulator.CoreSimulatorService $(command -v dotnet || true) $(command -v python3 || true) $PYTHON_BIN $PYS"
           add() {
             db="$1"; svc="$2"; client="$3"; ctype="$4"; extra_t="${5:-0}"; extra_id="${6:-}"
             sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier_type,indirect_object_identifier,flags,last_modified) VALUES ('$svc','$client',$ctype,2,4,1,$extra_t,'${extra_id:-UNUSED}',0,strftime('%s','now'));" 2>&1 | head -2
@@ -94,7 +106,10 @@ jobs:
           done
           sudo killall tccd 2>/dev/null || true
           sudo killall -9 com.apple.CoreSimulator.CoreSimulatorService 2>/dev/null || true
-          sleep 2
+          for i in $(seq 1 15); do
+            xcrun simctl list runtimes >/dev/null 2>&1 && break
+            sleep 1
+          done
 
       - name: Create and boot the simulator
         run: |
@@ -129,10 +144,6 @@ jobs:
           xcrun simctl privacy "$UDID" grant siri || true
           xcrun simctl list devices | grep "$UDID"
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Install cloudflared (tunnel)
         run: |
           brew install cloudflared
@@ -142,15 +153,14 @@ jobs:
         continue-on-error: true
         run: |
           brew tap facebook/fb
-          brew trust facebook/fb
           brew install idb-companion
-          pip install fb-idb
+          "$PYTHON_BIN" -m pip install fb-idb
           idb --help | head -3
 
       - name: Install aiohttp (+ sounddevice for audio)
         run: |
-          pip install aiohttp
-          pip install sounddevice || echo "sounddevice failed: audio disabled"
+          "$PYTHON_BIN" -m pip install aiohttp
+          "$PYTHON_BIN" -m pip install sounddevice || echo "sounddevice failed: audio disabled"
 
       - name: Install simpod (volume buttons, rotation)
         continue-on-error: true
@@ -240,12 +250,13 @@ jobs:
               @MainActor
               func testLoop() throws {
                   continueAfterFailure = true
+                  let device = XCUIDevice.shared
+                  device.press(.home)
                   let home = ProcessInfo.processInfo.environment["SIMULATOR_HOST_HOME"] ?? NSHomeDirectory()
                   let cmd = home + "/xcbtn.cmd", ready = home + "/xcbtn.ready", out = home + "/xcbtn.result"
                   let fm = FileManager.default
                   fm.createFile(atPath: ready, contents: Data("1".utf8))
                   defer { try? fm.removeItem(atPath: ready) }
-                  let device = XCUIDevice.shared
                   let end = Date().addingTimeInterval(6 * 3600)
                   while Date() < end {
                       if let data = fm.contents(atPath: cmd), let raw = String(data: data, encoding: .utf8) {
@@ -1920,10 +1931,11 @@ jobs:
           if __name__ == "__main__":
               asyncio.run(main())
           PYEOF
-          python3 -m py_compile server.py && echo "server.py OK"
+          "$PYTHON_BIN" -m py_compile server.py && echo "server.py OK"
 
       - name: Start session and print the link
         run: |
+          export RUNNER_TRACKING_ID=""
           export TOKEN=$(openssl rand -hex 12)
           export PORT=8080
           export FPS=30
@@ -1938,7 +1950,7 @@ jobs:
           fi
 
           if command -v idb_companion >/dev/null && command -v idb >/dev/null; then
-            nohup idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" > companion.log 2>&1 &
+            nohup idb_companion --udid "$UDID" --grpc-port "$GRPC_PORT" </dev/null > companion.log 2>&1 &
             for i in $(seq 1 40); do nc -z localhost "$GRPC_PORT" 2>/dev/null && break; sleep 1; done
             if nc -z localhost "$GRPC_PORT" 2>/dev/null; then
               echo "idb companion is listening"
@@ -1959,11 +1971,7 @@ jobs:
           XR=$(ls bridge/build/Build/Products/*.xctestrun 2>/dev/null | head -1 || true)
           if [ -n "$XR" ]; then
             touch "$HOME/xcbtn.running"
-            XR="$XR" UDID="$UDID" nohup bash -c 'while true; do xcodebuild test-without-building -xctestrun "$XR" -destination "id=$UDID" >> bridge.log 2>&1; rm -f "$HOME/xcbtn.ready"; sleep 2; done' > /dev/null 2>&1 &
-            (
-              for i in $(seq 1 120); do [ -f "$HOME/xcbtn.ready" ] && break; sleep 2; done
-              if [ -f "$HOME/xcbtn.ready" ]; then echo "button bridge ready"; else echo "button bridge NOT ready:"; tail -40 bridge.log; fi
-            ) &
+            XR="$XR" UDID="$UDID" nohup bash -c 'while true; do xcodebuild test-without-building -xctestrun "$XR" -destination "id=$UDID" >> bridge.log 2>&1; rm -f "$HOME/xcbtn.ready"; sleep 2; done' </dev/null > /dev/null 2>&1 &
           else
             echo "button bridge was not built: Action button / Ask Siri unavailable"
           fi
@@ -1998,20 +2006,21 @@ jobs:
           done
           SH
           chmod +x allow.sh
-          if [ "$AUDIO" = "true" ]; then nohup ./allow.sh > /dev/null 2>&1 & fi
+          if [ "$AUDIO" = "true" ]; then nohup ./allow.sh </dev/null > /dev/null 2>&1 & fi
 
-          nohup python3 server.py > server.log 2>&1 &
+          nohup "$PYTHON_BIN" server.py </dev/null > server.log 2>&1 &
           SERVER_PID=$!
+          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
           for i in $(seq 1 90); do
             curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null 2>/dev/null && break
             kill -0 "$SERVER_PID" 2>/dev/null || { echo "server exited:"; cat server.log; exit 1; }
             sleep 1
           done
           curl -fsS "http://127.0.0.1:$PORT/?key=$TOKEN" -o /dev/null || { echo "server not answering after 90s:"; cat server.log; exit 1; }
-          tail -n +1 -f server.log &
 
-          nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 > cf.log 2>&1 &
+          nohup cloudflared tunnel --url "http://127.0.0.1:$PORT" --no-autoupdate --protocol http2 </dev/null > cf.log 2>&1 &
           CF_PID=$!
+          echo "CF_PID=$CF_PID" >> "$GITHUB_ENV"
           URL=""
           for i in $(seq 1 60); do
             URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' cf.log | head -1 || true)
@@ -2029,11 +2038,16 @@ jobs:
             echo
             echo "Anyone with this link can control the simulator. It ends in $MINUTES minutes or when you press Stop session."
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "=========================================="
           echo "OPEN THIS: $FULL"
+          echo "=========================================="
 
+      - name: Keep session alive
+        run: |
+          tail -n +1 -f server.log &
+          TAIL_PID=$!
           END=$((SECONDS + MINUTES * 60))
           while kill -0 "$SERVER_PID" 2>/dev/null && [ "$SECONDS" -lt "$END" ]; do sleep 5; done
-
-          kill "$SERVER_PID" "$CF_PID" 2>/dev/null || true
+          kill "$TAIL_PID" "$SERVER_PID" "$CF_PID" 2>/dev/null || true
           xcrun simctl shutdown "$UDID" || true
           echo "Session ended."
